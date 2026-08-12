@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -9,7 +10,10 @@ from typing import Iterable, List, Optional
 from .discovery import discover_dependencies
 from .model import Dependency
 from .profiler import Profiler
-from .source_lookup import enrich_dependencies, find_source
+from .source_lookup import DISCOVERY_ONLY_ECOSYSTEMS, SOURCE_LOOKUP_ECOSYSTEMS, enrich_dependencies, find_source
+
+
+DISCOVERABLE_ECOSYSTEMS = tuple(sorted(SOURCE_LOOKUP_ECOSYSTEMS | DISCOVERY_ONLY_ECOSYSTEMS))
 
 
 def build_scan_parser(prog: str = "kasif") -> argparse.ArgumentParser:
@@ -35,6 +39,44 @@ def build_scan_parser(prog: str = "kasif") -> argparse.ArgumentParser:
         help="Do not skip common generated/vendor directories such as node_modules, target, and .git.",
     )
     parser.add_argument(
+        "--ecosystem",
+        action="append",
+        choices=DISCOVERABLE_ECOSYSTEMS,
+        default=None,
+        help="Only include dependencies from this ecosystem. May be repeated.",
+    )
+    parser.add_argument(
+        "--exclude-ecosystem",
+        action="append",
+        choices=DISCOVERABLE_ECOSYSTEMS,
+        default=None,
+        help="Exclude dependencies from this ecosystem. May be repeated.",
+    )
+    parser.add_argument(
+        "--manifest",
+        action="append",
+        type=Path,
+        default=None,
+        help="Parse only this manifest path, relative to the scan directory unless absolute. May be repeated.",
+    )
+    parser.add_argument(
+        "--include-path",
+        action="append",
+        default=None,
+        help="Only include manifest paths matching this relative path or glob. May be repeated.",
+    )
+    parser.add_argument(
+        "--exclude-path",
+        action="append",
+        default=None,
+        help="Exclude manifest paths matching this relative path or glob. May be repeated.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail when a selected manifest is malformed or unreadable.",
+    )
+    parser.add_argument(
         "--resolve-sources",
         action="store_true",
         help="Resolve verified source repositories for exact-version dependencies.",
@@ -46,10 +88,51 @@ def build_scan_parser(prog: str = "kasif") -> argparse.ArgumentParser:
         help="Checkout directory passed to Kasif source lookup.",
     )
     parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Kasif cache root. Defaults to KASIF_CACHE_DIR or the platform cache directory.",
+    )
+    parser.add_argument(
         "--git-timeout-seconds",
         type=int,
         default=300,
         help="Timeout per Git command in Kasif source lookup.",
+    )
+    parser.add_argument(
+        "--http-timeout-seconds",
+        type=int,
+        default=None,
+        help="Timeout per HTTP registry/archive request in Kasif source lookup.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Retry count for transient HTTP registry/archive failures.",
+    )
+    parser.add_argument(
+        "--offline",
+        "--cache-only",
+        action="store_true",
+        help="Do not perform network source lookups. Currently reports NETWORK_DISABLED for uncached lookups.",
+    )
+    parser.add_argument(
+        "--maven-repository",
+        action="append",
+        default=None,
+        help="Maven repository base URL to query before defaults. May be repeated.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write command output to a file instead of stdout.",
+    )
+    parser.add_argument(
+        "--fail-on-unresolved",
+        action="store_true",
+        help="Return a non-zero exit code when --resolve-sources leaves any dependency unresolved.",
     )
     parser.add_argument(
         "--max-source-resolutions",
@@ -80,7 +163,7 @@ def build_find_source_parser() -> argparse.ArgumentParser:
         prog="kasif find-source",
         description="Resolve the verified source repository for one package coordinate.",
     )
-    parser.add_argument("--ecosystem", required=True, choices=("maven", "npm", "pypi", "pub", "go", "git"))
+    parser.add_argument("--ecosystem", required=True, choices=DISCOVERABLE_ECOSYSTEMS)
     parser.add_argument("--package", required=True, dest="package_name")
     parser.add_argument("--version", required=True)
     parser.add_argument("--format", choices=("json", "table"), default="json")
@@ -91,10 +174,46 @@ def build_find_source_parser() -> argparse.ArgumentParser:
         help="Directory where temporary Git checkouts are created.",
     )
     parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Kasif cache root. Defaults to KASIF_CACHE_DIR or the platform cache directory.",
+    )
+    parser.add_argument(
         "--git-timeout-seconds",
         type=int,
         default=300,
         help="Timeout per Git command in source lookup.",
+    )
+    parser.add_argument(
+        "--http-timeout-seconds",
+        type=int,
+        default=None,
+        help="Timeout per HTTP registry/archive request in source lookup.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Retry count for transient HTTP registry/archive failures.",
+    )
+    parser.add_argument(
+        "--offline",
+        "--cache-only",
+        action="store_true",
+        help="Do not perform network source lookups. Currently reports NETWORK_DISABLED for uncached lookups.",
+    )
+    parser.add_argument(
+        "--maven-repository",
+        action="append",
+        default=None,
+        help="Maven repository base URL to query before defaults. May be repeated.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write command output to a file instead of stdout.",
     )
     parser.add_argument(
         "--enable-profiler",
@@ -134,28 +253,52 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error(f"path is not a directory: {root}")
     if args.git_timeout_seconds <= 0:
         parser.error("--git-timeout-seconds must be greater than zero")
+    if args.http_timeout_seconds is not None and args.http_timeout_seconds <= 0:
+        parser.error("--http-timeout-seconds must be greater than zero")
+    if args.retries < 0:
+        parser.error("--retries must be zero or greater")
     if args.max_source_resolutions is not None and args.max_source_resolutions < 0:
         parser.error("--max-source-resolutions must be zero or greater")
+    if args.fail_on_unresolved and not args.resolve_sources:
+        parser.error("--fail-on-unresolved requires --resolve-sources")
 
     profiler = Profiler() if args.enable_profiler else None
     progress = print_progress if args.progress else None
-    dependencies = discover_dependencies(root, use_default_ignores=not args.no_default_ignores, progress=progress)
+    maven_repositories = merged_maven_repositories(args.maven_repository)
+    dependencies = discover_dependencies(
+        root,
+        use_default_ignores=not args.no_default_ignores,
+        progress=progress,
+        include_ecosystems=args.ecosystem,
+        exclude_ecosystems=args.exclude_ecosystem,
+        include_paths=args.include_path,
+        exclude_paths=args.exclude_path,
+        manifest_paths=args.manifest,
+        strict=args.strict,
+    )
     if args.resolve_sources:
         dependencies = enrich_dependencies(
             dependencies,
             checkout_dir=args.kasif_checkout_dir,
+            cache_dir=args.cache_dir,
             git_timeout_seconds=args.git_timeout_seconds,
+            http_timeout_seconds=args.http_timeout_seconds,
+            http_retries=args.retries,
+            maven_repositories=maven_repositories,
+            offline=args.offline,
             profiler=profiler,
             shallow_check=args.shallow_check,
             progress=progress,
             max_source_resolutions=args.max_source_resolutions,
         )
     if args.format == "json":
-        print(json.dumps([dependency.to_dict() for dependency in dependencies], indent=2, sort_keys=True))
+        output_text = json.dumps([dependency.to_dict() for dependency in dependencies], indent=2, sort_keys=True) + "\n"
     else:
-        print_table(dependencies)
-    sys.stdout.flush()
+        output_text = table_text(dependencies)
+    emit_output(output_text, args.output)
     print_profiler(profiler)
+    if args.fail_on_unresolved and any((dependency.source or {}).get("status") != "FOUND" for dependency in dependencies):
+        return 1
     return 0
 
 
@@ -181,6 +324,10 @@ def find_source_main(argv: List[str]) -> int:
     args = parser.parse_args(argv)
     if args.git_timeout_seconds <= 0:
         parser.error("--git-timeout-seconds must be greater than zero")
+    if args.http_timeout_seconds is not None and args.http_timeout_seconds <= 0:
+        parser.error("--http-timeout-seconds must be greater than zero")
+    if args.retries < 0:
+        parser.error("--retries must be zero or greater")
     profiler = Profiler() if args.enable_profiler else None
     progress = print_progress if args.progress else None
     response = find_source(
@@ -188,16 +335,21 @@ def find_source_main(argv: List[str]) -> int:
         args.package_name,
         args.version,
         checkout_dir=args.kasif_checkout_dir,
+        cache_dir=args.cache_dir,
         git_timeout_seconds=args.git_timeout_seconds,
+        http_timeout_seconds=args.http_timeout_seconds,
+        http_retries=args.retries,
+        maven_repositories=merged_maven_repositories(args.maven_repository),
+        offline=args.offline,
         profiler=profiler,
         shallow_check=args.shallow_check,
         progress=progress,
     )
     if args.format == "json":
-        print(json.dumps(response, indent=2, sort_keys=True))
+        output_text = json.dumps(response, indent=2, sort_keys=True) + "\n"
     else:
-        print_source_response(response)
-    sys.stdout.flush()
+        output_text = source_response_text(response)
+    emit_output(output_text, args.output)
     print_profiler(profiler)
     return 0 if response["status"] == "FOUND" else 1
 
@@ -216,7 +368,8 @@ def print_progress(message: str) -> None:
     print(f"[kasif] {message}", file=sys.stderr, flush=True)
 
 
-def print_source_response(response: dict) -> None:
+def source_response_text(response: dict) -> str:
+    lines = []
     for key in (
         "status",
         "sourceKind",
@@ -232,12 +385,13 @@ def print_source_response(response: dict) -> None:
         "errorCode",
         "message",
     ):
-        print(f"{key}={response.get(key)}")
-    print("ocakGitArguments=" + " ".join(response.get("ocakGitArguments") or []))
-    print("ocakArguments=" + " ".join(response.get("ocakArguments") or []))
+        lines.append(f"{key}={response.get(key)}")
+    lines.append("kasifGitArguments=" + " ".join(response.get("kasifGitArguments") or []))
+    lines.append("kasifArguments=" + " ".join(response.get("kasifArguments") or []))
+    return "\n".join(lines) + "\n"
 
 
-def print_table(dependencies: Iterable[Dependency]) -> None:
+def table_text(dependencies: Iterable[Dependency]) -> str:
     dependency_list = list(dependencies)
     include_source = any(dependency.source is not None for dependency in dependency_list)
     headers = ["ecosystem", "name", "version", "requirement", "scope", "manager", "source_file"]
@@ -270,12 +424,39 @@ def print_table(dependencies: Iterable[Dependency]) -> None:
     def render(row: List[str]) -> str:
         return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
 
-    print(render(headers))
-    print(render(["-" * width for width in widths]))
+    lines = [render(headers), render(["-" * width for width in widths])]
     for row in rows:
-        print(render(row))
+        lines.append(render(row))
     if not rows:
         print("(no dependencies found)", file=sys.stderr)
+    return "\n".join(lines) + "\n"
+
+
+def emit_output(output_text: str, output_path: Optional[Path]) -> None:
+    if output_path is None:
+        print(output_text, end="")
+        sys.stdout.flush()
+        return
+    output_path.expanduser().parent.mkdir(parents=True, exist_ok=True)
+    output_path.expanduser().write_text(output_text, encoding="utf-8")
+
+
+def merged_maven_repositories(cli_repositories: Optional[List[str]]) -> Optional[List[str]]:
+    values = []
+    env_value = os.environ.get("KASIF_MAVEN_REPOSITORIES") or os.environ.get("KASIF_MAVEN_REPOSITORY")
+    if cli_repositories:
+        values.extend(cli_repositories)
+    if env_value:
+        values.extend(part.strip() for part in env_value.split(","))
+    return [value for value in values if value] or None
+
+
+def print_source_response(response: dict) -> None:
+    print(source_response_text(response), end="")
+
+
+def print_table(dependencies: Iterable[Dependency]) -> None:
+    print(table_text(dependencies), end="")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from kasif.source_lookup import (
     http_json,
     kasif_version,
     normalize_repository_url,
+    normalized_maven_repositories,
     resolve_pypi,
     resolve_git_ref,
     run_git,
@@ -111,7 +112,9 @@ class SourceLookupTest(unittest.TestCase):
             "commit1",
             "--package-coordinate",
             "pypi:tzlocal@3.0",
-        ], response["ocakGitArguments"])
+        ], response["kasifGitArguments"])
+        self.assertEqual(response["kasifGitArguments"], response["kasifArguments"])
+        self.assertEqual(response["kasifGitArguments"], response["ocakGitArguments"])
         self.assertEqual(response["ocakGitArguments"], response["ocakArguments"])
 
     def test_find_source_maps_source_lookup_errors_to_failed_response(self) -> None:
@@ -125,6 +128,8 @@ class SourceLookupTest(unittest.TestCase):
         self.assertEqual("SOURCE_NOT_FOUND", response["status"])
         self.assertEqual("npm:missing@1.0.0", response["packageCoordinate"])
         self.assertEqual("SOURCE_METADATA_MISSING", response["errorCode"])
+        self.assertEqual([], response["kasifGitArguments"])
+        self.assertEqual([], response["kasifArguments"])
         self.assertEqual([], response["ocakGitArguments"])
         self.assertEqual([], response["ocakArguments"])
 
@@ -158,9 +163,10 @@ class SourceLookupTest(unittest.TestCase):
             "commit1",
             "--package-coordinate",
             "maven:org.springframework:spring-web@5.0.20.RELEASE",
-        ], response["ocakGitArguments"])
+        ], response["kasifGitArguments"])
+        self.assertEqual(response["kasifGitArguments"], response["ocakGitArguments"])
 
-    def test_checkout_defaults_to_defter_cache_dir(self) -> None:
+    def test_checkout_defaults_to_kasif_cache_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "cache"
 
@@ -169,7 +175,7 @@ class SourceLookupTest(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, stdout="commit1\n", stderr="")
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-            with patch.dict("os.environ", {"DEFTER_CACHE_DIR": str(cache_dir)}, clear=False):
+            with patch.dict("os.environ", {"KASIF_CACHE_DIR": str(cache_dir)}, clear=False):
                 checkout_root, resolved_commit = checkout_git_ref(
                     "https://github.com/example/demo.git",
                     "commit1",
@@ -180,6 +186,26 @@ class SourceLookupTest(unittest.TestCase):
 
         self.assertEqual("commit1", resolved_commit)
         self.assertIn("kasif-source-", checkout_root.name)
+        self.assertEqual(cache_dir / "v1" / "sources" / "kasif-checkouts", checkout_root.parent)
+
+    def test_checkout_preserves_legacy_cache_env_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "legacy-cache"
+
+            def fake_runner(command: list[str], **_: object) -> subprocess.CompletedProcess:
+                if command[-2:] == ["rev-parse", "HEAD"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="commit1\n", stderr="")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch.dict("os.environ", {"DEFTER_CACHE_DIR": str(cache_dir)}, clear=False):
+                checkout_root, _resolved_commit = checkout_git_ref(
+                    "https://github.com/example/demo.git",
+                    "commit1",
+                    checkout_dir=None,
+                    timeout_seconds=1,
+                    runner=fake_runner,
+                )
+
         self.assertEqual(cache_dir / "v1" / "sources" / "kasif-checkouts", checkout_root.parent)
 
     def test_fetch_maven_pom_falls_back_to_google_maven(self) -> None:
@@ -196,6 +222,12 @@ class SourceLookupTest(unittest.TestCase):
 
         self.assertIsNotNone(pom)
         self.assertEqual("firebase-core", pom.findtext("artifactId"))
+
+    def test_custom_maven_repositories_are_queried_before_defaults(self) -> None:
+        repositories = normalized_maven_repositories(["https://repo.example.test/maven2"])
+
+        self.assertEqual("https://repo.example.test/maven2/", repositories[0])
+        self.assertIn("https://repo1.maven.org/maven2/", repositories)
 
     def test_enriches_dependency_without_java_bridge(self) -> None:
         with patch("kasif.source_lookup.find_source", return_value={"status": "FOUND", "repositoryUrl": "repo"}):
@@ -358,9 +390,10 @@ class SourceLookupTest(unittest.TestCase):
         self.assertEqual("archive", response["sourceKind"])
         self.assertEqual("package/package.json", response["manifestPath"])
         self.assertEqual("package", response["repositorySubdirectory"])
-        self.assertEqual([], response["ocakGitArguments"])
-        self.assertIn("--archive-file", response["ocakArguments"])
-        self.assertIn("--archive-sha256", response["ocakArguments"])
+        self.assertEqual([], response["kasifGitArguments"])
+        self.assertIn("--archive-file", response["kasifArguments"])
+        self.assertIn("--archive-sha256", response["kasifArguments"])
+        self.assertEqual(response["kasifArguments"], response["ocakArguments"])
         self.assertEqual(digest, response["sourceArchiveSha256"])
 
     def test_resolve_pypi_ignores_documentation_homepage_when_archive_exists(self) -> None:
@@ -465,6 +498,21 @@ class SourceLookupTest(unittest.TestCase):
                 http_json("https://example.test/package")
 
         self.assertEqual("SOURCE_METADATA_INVALID", context.exception.error_code)
+
+    def test_enrich_marks_discovery_only_ecosystems_as_unsupported(self) -> None:
+        with patch("kasif.source_lookup.find_source") as find_source_mock:
+            enriched = enrich_dependencies([dependency("conan", "zlib", "1.3.1")])
+
+        find_source_mock.assert_not_called()
+        self.assertEqual("SKIPPED", enriched[0].source["status"])
+        self.assertEqual("UNSUPPORTED_ECOSYSTEM", enriched[0].source["errorCode"])
+        self.assertEqual("conan:zlib@1.3.1", enriched[0].source["packageCoordinate"])
+
+    def test_find_source_reports_unsupported_ecosystem_as_json_result(self) -> None:
+        response = find_source("vcpkg", "openssl", "3.2.0")
+
+        self.assertEqual("FAILED", response["status"])
+        self.assertEqual("UNSUPPORTED_ECOSYSTEM", response["errorCode"])
 
     def test_subdirectory_manifest_is_returned_as_ocak_subdir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

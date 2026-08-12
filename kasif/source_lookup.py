@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from .model import Dependency
 from .parsers import normalize_pypi_name, read_text
-from .paths import defter_cache_path
+from .paths import cache_path_from, kasif_cache_path
 from .profiler import Profiler, directory_size, git_object_store_size
 
 
@@ -35,6 +35,8 @@ MAVEN_REPOSITORIES = (
     "https://repo1.maven.org/maven2/",
     "https://dl.google.com/dl/android/maven2/",
 )
+SOURCE_LOOKUP_ECOSYSTEMS = {"pypi", "npm", "pub", "maven", "go", "git"}
+DISCOVERY_ONLY_ECOSYSTEMS = {"vcpkg", "conan", "cmake"}
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,12 @@ class GitRemoteRef:
 def enrich_dependencies(
     dependencies: Iterable[Dependency],
     checkout_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
     git_timeout_seconds: int = 300,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
+    offline: bool = False,
     runner: Runner = subprocess.run,
     profiler: Optional[Profiler] = None,
     shallow_check: bool = False,
@@ -105,7 +112,12 @@ def enrich_dependencies(
         source = resolve_dependency_source(
             dependency,
             checkout_dir=checkout_dir,
+            cache_dir=cache_dir,
             git_timeout_seconds=git_timeout_seconds,
+            http_timeout_seconds=http_timeout_seconds,
+            http_retries=http_retries,
+            maven_repositories=maven_repositories,
+            offline=offline,
             runner=runner,
             profiler=profiler,
             shallow_check=shallow_check,
@@ -123,12 +135,21 @@ def enrich_dependencies(
 def resolve_dependency_source(
     dependency: Dependency,
     checkout_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
     git_timeout_seconds: int = 300,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
+    offline: bool = False,
     runner: Runner = subprocess.run,
     profiler: Optional[Profiler] = None,
     shallow_check: bool = False,
     progress: Optional[Progress] = None,
 ) -> Dict[str, Any]:
+    if dependency.ecosystem not in SOURCE_LOOKUP_ECOSYSTEMS:
+        message = f"Source lookup is not supported for ecosystem: {dependency.ecosystem}."
+        report_progress(progress, f"skip unsupported ecosystem {dependency_coordinate(dependency)}")
+        return skipped("UNSUPPORTED_ECOSYSTEM", message, package_coordinate=dependency_coordinate(dependency))
     version = kasif_version(dependency)
     if version is None:
         report_progress(progress, f"skip non-exact dependency {dependency_coordinate(dependency)}")
@@ -138,7 +159,12 @@ def resolve_dependency_source(
         dependency.name,
         version,
         checkout_dir=checkout_dir,
+        cache_dir=cache_dir,
         git_timeout_seconds=git_timeout_seconds,
+        http_timeout_seconds=http_timeout_seconds,
+        http_retries=http_retries,
+        maven_repositories=maven_repositories,
+        offline=offline,
         runner=runner,
         profiler=profiler,
         shallow_check=shallow_check,
@@ -151,7 +177,12 @@ def find_source(
     package: str,
     version: str,
     checkout_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
     git_timeout_seconds: int = 300,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
+    offline: bool = False,
     runner: Runner = subprocess.run,
     profiler: Optional[Profiler] = None,
     shallow_check: bool = False,
@@ -162,13 +193,36 @@ def find_source(
     version = version.strip()
     package_coordinate = f"{ecosystem}:{package}@{version}"
     try:
+        if offline:
+            raise SourceLookupError(
+                "SOURCE_NOT_FOUND",
+                "NETWORK_DISABLED",
+                "Network access is disabled by --offline/--cache-only; registry source lookup cannot run.",
+            )
         report_progress(progress, f"{package_coordinate} registry lookup")
         with profile_stage(profiler, "registry", f"{ecosystem}:{package}@{version}"):
-            resolution = resolve_registry_source(ecosystem, package, version, profiler)
+            resolution = resolve_registry_source(
+                ecosystem,
+                package,
+                version,
+                profiler,
+                http_timeout_seconds=http_timeout_seconds,
+                http_retries=http_retries,
+                maven_repositories=maven_repositories,
+            )
         report_progress(progress, f"{package_coordinate} registry source={resolution.repository_url}")
         if not resolution.repository_url:
             report_progress(progress, f"{package_coordinate} registry source unavailable; trying archive")
-            return archive_found_response_for_resolution(resolution, package_coordinate, checkout_dir, profiler, progress)
+            return archive_found_response_for_resolution(
+                resolution,
+                package_coordinate,
+                checkout_dir,
+                cache_dir,
+                profiler,
+                progress,
+                http_timeout_seconds=http_timeout_seconds,
+                http_retries=http_retries,
+            )
         report_progress(progress, f"{package_coordinate} normalizing repository")
         try:
             with profile_stage(profiler, "normalize_repository", resolution.repository_url):
@@ -177,7 +231,16 @@ def find_source(
             if not can_try_archive(resolution):
                 raise
             report_progress(progress, f"{package_coordinate} repository metadata not cloneable; trying archive")
-            return archive_found_response_for_resolution(resolution, package_coordinate, checkout_dir, profiler, progress)
+            return archive_found_response_for_resolution(
+                resolution,
+                package_coordinate,
+                checkout_dir,
+                cache_dir,
+                profiler,
+                progress,
+                http_timeout_seconds=http_timeout_seconds,
+                http_retries=http_retries,
+            )
         resolution = SourceResolution(
             ecosystem=resolution.ecosystem,
             package=resolution.package,
@@ -196,7 +259,16 @@ def find_source(
             if error.error_code != "VERSION_REF_NOT_FOUND" or not can_try_archive(resolution):
                 raise
             report_progress(progress, f"{package_coordinate} git ref unavailable; trying archive")
-            return archive_found_response_for_resolution(resolution, package_coordinate, checkout_dir, profiler, progress)
+            return archive_found_response_for_resolution(
+                resolution,
+                package_coordinate,
+                checkout_dir,
+                cache_dir,
+                profiler,
+                progress,
+                http_timeout_seconds=http_timeout_seconds,
+                http_retries=http_retries,
+            )
         report_progress(progress, f"{package_coordinate} git ref matched={matched_ref} commit={matched_commit[:12]}")
         if shallow_check:
             report_progress(progress, f"{package_coordinate} shallow check complete; checkout skipped")
@@ -206,7 +278,7 @@ def find_source(
             checkout_root, resolved_commit = checkout_git_ref(
                 resolution.repository_url,
                 matched_ref,
-                checkout_dir,
+                checkout_dir or source_checkout_dir(cache_dir),
                 git_timeout_seconds,
                 runner,
                 profiler,
@@ -234,24 +306,43 @@ def profile_stage(profiler: Optional[Profiler], stage: str, detail: str, **metad
         yield
 
 
-def resolve_registry_source(ecosystem: str, package: str, version: str, profiler: Optional[Profiler] = None) -> SourceResolution:
+def resolve_registry_source(
+    ecosystem: str,
+    package: str,
+    version: str,
+    profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
+) -> SourceResolution:
     if ecosystem == "pypi":
-        return resolve_pypi(package, version, profiler)
+        return resolve_pypi(package, version, profiler, http_timeout_seconds, http_retries)
     if ecosystem == "npm":
-        return resolve_npm(package, version, profiler)
+        return resolve_npm(package, version, profiler, http_timeout_seconds, http_retries)
     if ecosystem == "pub":
-        return resolve_pub(package, version, profiler)
+        return resolve_pub(package, version, profiler, http_timeout_seconds, http_retries)
     if ecosystem == "maven":
-        return resolve_maven(package, version, profiler)
+        return resolve_maven(package, version, profiler, http_timeout_seconds, http_retries, maven_repositories)
     if ecosystem == "go":
-        return resolve_go(package, version, profiler)
+        return resolve_go(package, version, profiler, http_timeout_seconds, http_retries)
     if ecosystem == "git":
         return SourceResolution("git", package, version, package, version, None)
     raise SourceLookupError("FAILED", "UNSUPPORTED_ECOSYSTEM", f"Unsupported ecosystem: {ecosystem}")
 
 
-def resolve_pypi(package: str, version: str, profiler: Optional[Profiler] = None) -> SourceResolution:
-    metadata = http_json(f"https://pypi.org/pypi/{urllib.parse.quote(package)}/{urllib.parse.quote(version)}/json", profiler)
+def resolve_pypi(
+    package: str,
+    version: str,
+    profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+) -> SourceResolution:
+    metadata = http_json(
+        f"https://pypi.org/pypi/{urllib.parse.quote(package)}/{urllib.parse.quote(version)}/json",
+        profiler,
+        timeout_seconds=http_timeout_seconds,
+        retries=http_retries,
+    )
     info = metadata.get("info") or {}
     project_urls = info.get("project_urls") or {}
     repository_url = None
@@ -276,9 +367,20 @@ def resolve_pypi(package: str, version: str, profiler: Optional[Profiler] = None
     return SourceResolution("pypi", normalize_pypi_name(package), version, repository_url or "", "v" + version, None, archive_url, archive_sha)
 
 
-def resolve_npm(package: str, version: str, profiler: Optional[Profiler] = None) -> SourceResolution:
+def resolve_npm(
+    package: str,
+    version: str,
+    profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+) -> SourceResolution:
     encoded_name = urllib.parse.quote(package, safe="")
-    metadata = http_json(f"https://registry.npmjs.org/{encoded_name}/{urllib.parse.quote(version, safe='')}", profiler)
+    metadata = http_json(
+        f"https://registry.npmjs.org/{encoded_name}/{urllib.parse.quote(version, safe='')}",
+        profiler,
+        timeout_seconds=http_timeout_seconds,
+        retries=http_retries,
+    )
     repository = metadata.get("repository")
     repository_url = None
     repository_directory = None
@@ -299,8 +401,19 @@ def resolve_npm(package: str, version: str, profiler: Optional[Profiler] = None)
     return SourceResolution("npm", package.lower(), version, repository_url or "", "v" + version, repository_directory, archive_url, None)
 
 
-def resolve_pub(package: str, version: str, profiler: Optional[Profiler] = None) -> SourceResolution:
-    metadata = http_json(f"https://pub.dev/api/packages/{urllib.parse.quote(package)}/versions/{urllib.parse.quote(version)}", profiler)
+def resolve_pub(
+    package: str,
+    version: str,
+    profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+) -> SourceResolution:
+    metadata = http_json(
+        f"https://pub.dev/api/packages/{urllib.parse.quote(package)}/versions/{urllib.parse.quote(version)}",
+        profiler,
+        timeout_seconds=http_timeout_seconds,
+        retries=http_retries,
+    )
     pubspec = metadata.get("pubspec") or {}
     repository_url = pubspec.get("repository")
     if repository_url is None:
@@ -322,26 +435,46 @@ def resolve_pub(package: str, version: str, profiler: Optional[Profiler] = None)
     )
 
 
-def resolve_maven(package: str, version: str, profiler: Optional[Profiler] = None) -> SourceResolution:
+def resolve_maven(
+    package: str,
+    version: str,
+    profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
+) -> SourceResolution:
     if ":" not in package:
         raise SourceLookupError("FAILED", "INVALID_COORDINATE", "Maven package must use groupId:artifactId.")
     group_id, artifact_id = package.split(":", 1)
-    pom = fetch_maven_pom(group_id, artifact_id, version, profiler)
+    pom = fetch_maven_pom(group_id, artifact_id, version, profiler, http_timeout_seconds, http_retries, maven_repositories)
     if pom is None:
         raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_VERSION_NOT_FOUND", f"Maven POM was not found for {package}@{version}.")
-    repository_url, tag = maven_repository_from_pom(pom, depth=0, profiler=profiler)
+    repository_url, tag = maven_repository_from_pom(
+        pom,
+        depth=0,
+        profiler=profiler,
+        http_timeout_seconds=http_timeout_seconds,
+        http_retries=http_retries,
+        maven_repositories=maven_repositories,
+    )
     if repository_url is None:
         raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_METADATA_MISSING", "Maven POM metadata did not contain SCM repository information.")
     return SourceResolution("maven", package, version, repository_url, tag, None)
 
 
-def resolve_go(package: str, version: str, profiler: Optional[Profiler] = None) -> SourceResolution:
+def resolve_go(
+    package: str,
+    version: str,
+    profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+) -> SourceResolution:
     parts = package.split("/")
     if (package.startswith("github.com/") or package.startswith("gitlab.com/")) and len(parts) >= 3:
         repository = f"https://{parts[0]}/{parts[1]}/{parts[2]}.git"
         subdirectory = None if len(parts) <= 3 or (len(parts) == 4 and re.fullmatch(r"v[2-9][0-9]*", parts[3])) else "/".join(parts[3:])
         return SourceResolution("go", package, version, repository, version, subdirectory)
-    html = http_text("https://" + package + "?go-get=1", profiler)
+    html = http_text("https://" + package + "?go-get=1", profiler, timeout_seconds=http_timeout_seconds, retries=http_retries)
     match = re.search(r'<meta\s+name=["\']go-import["\']\s+content=["\']([^"\']+)["\']', html)
     if not match:
         raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_METADATA_MISSING", "Go vanity module metadata did not contain go-import information.")
@@ -412,7 +545,7 @@ def checkout_git_ref(
     runner: Runner,
     profiler: Optional[Profiler] = None,
 ) -> Tuple[Path, str]:
-    parent = Path(checkout_dir) if checkout_dir is not None else defter_cache_path("v1", "sources", "kasif-checkouts")
+    parent = Path(checkout_dir) if checkout_dir is not None else kasif_cache_path("v1", "sources", "kasif-checkouts")
     try:
         parent.mkdir(parents=True, exist_ok=True)
         checkout_root = Path(tempfile.mkdtemp(prefix="kasif-source-", dir=str(parent)))
@@ -460,14 +593,25 @@ def archive_found_response_for_resolution(
     resolution: SourceResolution,
     package_coordinate: str,
     checkout_dir: Optional[Path],
+    cache_dir: Optional[Path],
     profiler: Optional[Profiler],
     progress: Optional[Progress],
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
 ) -> Dict[str, Any]:
     if not can_try_archive(resolution):
         raise SourceLookupError("VERSION_REF_NOT_FOUND", "VERSION_REF_NOT_FOUND", f"No repository ref could be verified for version {resolution.version}.")
     report_progress(progress, f"{package_coordinate} archive download starting url={resolution.source_archive_url}")
     with profile_stage(profiler, "archive_download", resolution.source_archive_url or ""):
-        archive_path, archive_sha256 = download_archive(resolution, package_coordinate, checkout_dir, profiler)
+        archive_path, archive_sha256 = download_archive(
+            resolution,
+            package_coordinate,
+            checkout_dir,
+            cache_dir,
+            profiler,
+            http_timeout_seconds=http_timeout_seconds,
+            http_retries=http_retries,
+        )
     report_progress(progress, f"{package_coordinate} archive cached path={archive_path}")
     with tempfile.TemporaryDirectory(prefix="kasif-archive-") as tmp:
         extract_root = Path(tmp) / "src"
@@ -487,16 +631,24 @@ def download_archive(
     resolution: SourceResolution,
     package_coordinate: str,
     checkout_dir: Optional[Path],
+    cache_dir: Optional[Path] = None,
     profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
 ) -> Tuple[Path, str]:
-    parent = archive_cache_dir(checkout_dir)
+    parent = archive_cache_dir(checkout_dir, cache_dir)
     try:
         parent.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise SourceLookupError("FAILED", "CACHE_UNAVAILABLE", f"Could not create archive cache directory: {error}")
     suffix = archive_suffix(resolution.source_archive_url or "")
     archive_path = parent / (safe_cache_name(package_coordinate) + suffix)
-    body = http_bytes(resolution.source_archive_url or "", profiler)
+    body = http_bytes(
+        resolution.source_archive_url or "",
+        profiler,
+        timeout_seconds=http_timeout_seconds,
+        retries=http_retries,
+    )
     actual_sha256 = hashlib.sha256(body).hexdigest()
     expected_sha256 = resolution.source_archive_sha256
     if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
@@ -508,10 +660,14 @@ def download_archive(
     return archive_path, actual_sha256
 
 
-def archive_cache_dir(checkout_dir: Optional[Path]) -> Path:
+def archive_cache_dir(checkout_dir: Optional[Path], cache_dir: Optional[Path] = None) -> Path:
     if checkout_dir is not None:
         return Path(checkout_dir) / "archives"
-    return defter_cache_path("v1", "sources", "kasif-archives")
+    return cache_path_from(cache_dir, "v1", "sources", "kasif-archives")
+
+
+def source_checkout_dir(cache_dir: Optional[Path]) -> Path:
+    return cache_path_from(cache_dir, "v1", "sources", "kasif-checkouts")
 
 
 def archive_suffix(url: str) -> str:
@@ -822,6 +978,7 @@ def found_response(
     verified_subdirectory: Optional[str],
     manifest_path: str,
 ) -> Dict[str, Any]:
+    git_args = kasif_arguments(resolution, resolved_commit, verified_subdirectory)
     return {
         "status": "FOUND",
         "sourceKind": "git",
@@ -834,8 +991,10 @@ def found_response(
         "sourceArchiveUrl": resolution.source_archive_url,
         "sourceArchiveSha256": resolution.source_archive_sha256,
         "sourceArchivePath": None,
-        "ocakGitArguments": ocak_arguments(resolution, resolved_commit, verified_subdirectory),
-        "ocakArguments": ocak_arguments(resolution, resolved_commit, verified_subdirectory),
+        "kasifGitArguments": git_args,
+        "kasifArguments": git_args,
+        "ocakGitArguments": git_args,
+        "ocakArguments": git_args,
         "errorCode": None,
         "message": None,
         "resolvedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -848,6 +1007,7 @@ def shallow_found_response(
     resolved_commit: str,
     matched_ref: str,
 ) -> Dict[str, Any]:
+    git_args = kasif_arguments(resolution, resolved_commit, resolution.repository_subdirectory)
     return {
         "status": "FOUND",
         "sourceKind": "git",
@@ -860,8 +1020,10 @@ def shallow_found_response(
         "sourceArchiveUrl": resolution.source_archive_url,
         "sourceArchiveSha256": resolution.source_archive_sha256,
         "sourceArchivePath": None,
-        "ocakGitArguments": ocak_arguments(resolution, resolved_commit, resolution.repository_subdirectory),
-        "ocakArguments": ocak_arguments(resolution, resolved_commit, resolution.repository_subdirectory),
+        "kasifGitArguments": git_args,
+        "kasifArguments": git_args,
+        "ocakGitArguments": git_args,
+        "ocakArguments": git_args,
         "errorCode": None,
         "message": "Shallow check resolved the version ref but skipped checkout and manifest verification.",
         "resolvedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -876,6 +1038,7 @@ def archive_found_response(
     verified_subdirectory: Optional[str],
     manifest_path: str,
 ) -> Dict[str, Any]:
+    archive_args = archive_kasif_arguments(resolution, archive_path, archive_sha256, verified_subdirectory)
     return {
         "status": "FOUND",
         "sourceKind": "archive",
@@ -888,15 +1051,17 @@ def archive_found_response(
         "sourceArchiveUrl": resolution.source_archive_url,
         "sourceArchiveSha256": archive_sha256,
         "sourceArchivePath": str(archive_path),
+        "kasifGitArguments": [],
+        "kasifArguments": archive_args,
         "ocakGitArguments": [],
-        "ocakArguments": archive_ocak_arguments(resolution, archive_path, archive_sha256, verified_subdirectory),
+        "ocakArguments": archive_args,
         "errorCode": None,
         "message": "Resolved from exact registry source archive after Git ref verification was unavailable.",
         "resolvedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 
-def ocak_arguments(resolution: SourceResolution, resolved_commit: str, repository_subdirectory: Optional[str]) -> List[str]:
+def kasif_arguments(resolution: SourceResolution, resolved_commit: str, repository_subdirectory: Optional[str]) -> List[str]:
     package_coordinate = f"{resolution.ecosystem}:{resolution.package}@{resolution.version}"
     args = [
         "--git-repo",
@@ -911,7 +1076,7 @@ def ocak_arguments(resolution: SourceResolution, resolved_commit: str, repositor
     return args
 
 
-def archive_ocak_arguments(
+def archive_kasif_arguments(
     resolution: SourceResolution,
     archive_path: Path,
     archive_sha256: str,
@@ -931,6 +1096,19 @@ def archive_ocak_arguments(
     return args
 
 
+def ocak_arguments(resolution: SourceResolution, resolved_commit: str, repository_subdirectory: Optional[str]) -> List[str]:
+    return kasif_arguments(resolution, resolved_commit, repository_subdirectory)
+
+
+def archive_ocak_arguments(
+    resolution: SourceResolution,
+    archive_path: Path,
+    archive_sha256: str,
+    repository_subdirectory: Optional[str],
+) -> List[str]:
+    return archive_kasif_arguments(resolution, archive_path, archive_sha256, repository_subdirectory)
+
+
 def failed_response(status: str, package_coordinate: Optional[str], error_code: str, message: str) -> Dict[str, Any]:
     return {
         "status": status,
@@ -944,6 +1122,8 @@ def failed_response(status: str, package_coordinate: Optional[str], error_code: 
         "sourceArchiveUrl": None,
         "sourceArchiveSha256": None,
         "sourceArchivePath": None,
+        "kasifGitArguments": [],
+        "kasifArguments": [],
         "ocakGitArguments": [],
         "ocakArguments": [],
         "errorCode": error_code,
@@ -952,15 +1132,20 @@ def failed_response(status: str, package_coordinate: Optional[str], error_code: 
     }
 
 
-def skipped(error_code: str, message: str) -> Dict[str, Any]:
-    response = failed_response("SKIPPED", None, error_code, message)
+def skipped(error_code: str, message: str, package_coordinate: Optional[str] = None) -> Dict[str, Any]:
+    response = failed_response("SKIPPED", package_coordinate, error_code, message)
     response["resolvedAt"] = None
     return response
 
 
-def http_json(url: str, profiler: Optional[Profiler] = None) -> Dict[str, Any]:
+def http_json(
+    url: str,
+    profiler: Optional[Profiler] = None,
+    timeout_seconds: Optional[int] = None,
+    retries: int = 0,
+) -> Dict[str, Any]:
     try:
-        metadata = json.loads(http_text(url, profiler))
+        metadata = json.loads(http_text(url, profiler, timeout_seconds=timeout_seconds, retries=retries))
     except json.JSONDecodeError as error:
         raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_METADATA_INVALID", f"Registry metadata was not valid JSON: {error.msg}")
     if not isinstance(metadata, dict):
@@ -968,43 +1153,77 @@ def http_json(url: str, profiler: Optional[Profiler] = None) -> Dict[str, Any]:
     return metadata
 
 
-def http_text(url: str, profiler: Optional[Profiler] = None) -> str:
+def http_text(
+    url: str,
+    profiler: Optional[Profiler] = None,
+    timeout_seconds: Optional[int] = None,
+    retries: int = 0,
+) -> str:
     request = urllib.request.Request(url, headers={"Accept": "application/json, text/html;q=0.8, */*;q=0.5"})
-    try:
-        started = time.perf_counter()
-        with urllib.request.urlopen(request, timeout=20) as response:
-            body = response.read()
-        if profiler is not None:
-            profiler.add_total("httpBytesReceived", len(body))
-            profiler.record("http", url, started, responseBytes=len(body))
+    attempts = checked_retries(retries) + 1
+    timeout = timeout_seconds if timeout_seconds is not None else 20
+    for attempt in range(attempts):
         try:
-            return body.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_METADATA_INVALID", f"Registry metadata was not UTF-8: {error}")
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_VERSION_NOT_FOUND", f"Registry metadata was not found: {url}")
-        raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_NOT_FOUND", f"Registry metadata request failed with HTTP {error.code}.")
-    except OSError as error:
-        raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_NOT_FOUND", f"Registry metadata request failed: {error}")
+            started = time.perf_counter()
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+            if profiler is not None:
+                profiler.add_total("httpBytesReceived", len(body))
+                profiler.record("http", url, started, responseBytes=len(body), attempt=attempt + 1)
+            try:
+                return body.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_METADATA_INVALID", f"Registry metadata was not UTF-8: {error}")
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_VERSION_NOT_FOUND", f"Registry metadata was not found: {url}")
+            if attempt + 1 >= attempts:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_NOT_FOUND", f"Registry metadata request failed with HTTP {error.code}.")
+            sleep_before_retry(attempt)
+        except OSError as error:
+            if attempt + 1 >= attempts:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_NOT_FOUND", f"Registry metadata request failed: {error}")
+            sleep_before_retry(attempt)
+    raise SourceLookupError("SOURCE_NOT_FOUND", "PACKAGE_NOT_FOUND", "Registry metadata request failed.")
 
 
-def http_bytes(url: str, profiler: Optional[Profiler] = None) -> bytes:
+def http_bytes(
+    url: str,
+    profiler: Optional[Profiler] = None,
+    timeout_seconds: Optional[int] = None,
+    retries: int = 0,
+) -> bytes:
     request = urllib.request.Request(url, headers={"Accept": "application/octet-stream, */*;q=0.5"})
-    try:
-        started = time.perf_counter()
-        with urllib.request.urlopen(request, timeout=60) as response:
-            body = response.read()
-        if profiler is not None:
-            profiler.add_total("httpBytesReceived", len(body))
-            profiler.record("http", url, started, responseBytes=len(body))
-        return body
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_NOT_FOUND", f"Source archive was not found: {url}")
-        raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_UNAVAILABLE", f"Source archive request failed with HTTP {error.code}.")
-    except OSError as error:
-        raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_UNAVAILABLE", f"Source archive request failed: {error}")
+    attempts = checked_retries(retries) + 1
+    timeout = timeout_seconds if timeout_seconds is not None else 60
+    for attempt in range(attempts):
+        try:
+            started = time.perf_counter()
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+            if profiler is not None:
+                profiler.add_total("httpBytesReceived", len(body))
+                profiler.record("http", url, started, responseBytes=len(body), attempt=attempt + 1)
+            return body
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_NOT_FOUND", f"Source archive was not found: {url}")
+            if attempt + 1 >= attempts:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_UNAVAILABLE", f"Source archive request failed with HTTP {error.code}.")
+            sleep_before_retry(attempt)
+        except OSError as error:
+            if attempt + 1 >= attempts:
+                raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_UNAVAILABLE", f"Source archive request failed: {error}")
+            sleep_before_retry(attempt)
+    raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_ARCHIVE_UNAVAILABLE", "Source archive request failed.")
+
+
+def checked_retries(retries: int) -> int:
+    return max(0, retries)
+
+
+def sleep_before_retry(attempt: int) -> None:
+    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
 
 
 def git_ls_remote(
@@ -1087,11 +1306,16 @@ def fetch_maven_pom(
     artifact_id: str,
     version: str,
     profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
 ) -> Optional[ET.Element]:
     path = f"{group_id.replace('.', '/')}/{artifact_id}/{version}/{artifact_id}-{version}.pom"
-    for repository in MAVEN_REPOSITORIES:
+    for repository in normalized_maven_repositories(maven_repositories):
         try:
-            return ET.fromstring(http_text(repository + path, profiler))
+            return ET.fromstring(
+                http_text(repository + path, profiler, timeout_seconds=http_timeout_seconds, retries=http_retries)
+            )
         except ET.ParseError as error:
             raise SourceLookupError("SOURCE_NOT_FOUND", "SOURCE_METADATA_INVALID", f"Maven POM metadata was not valid XML: {error}")
         except SourceLookupError as error:
@@ -1105,6 +1329,9 @@ def maven_repository_from_pom(
     root: ET.Element,
     depth: int,
     profiler: Optional[Profiler] = None,
+    http_timeout_seconds: Optional[int] = None,
+    http_retries: int = 0,
+    maven_repositories: Optional[Iterable[str]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     scm = xml_child(root, "scm")
     if scm is not None:
@@ -1121,10 +1348,40 @@ def maven_repository_from_pom(
         parent_artifact = xml_child_text(parent, "artifactId")
         parent_version = xml_child_text(parent, "version")
         if parent_group and parent_artifact and parent_version:
-            parent_pom = fetch_maven_pom(parent_group, parent_artifact, parent_version, profiler)
+            parent_pom = fetch_maven_pom(
+                parent_group,
+                parent_artifact,
+                parent_version,
+                profiler,
+                http_timeout_seconds,
+                http_retries,
+                maven_repositories,
+            )
             if parent_pom is not None:
-                return maven_repository_from_pom(parent_pom, depth + 1, profiler)
+                return maven_repository_from_pom(
+                    parent_pom,
+                    depth + 1,
+                    profiler,
+                    http_timeout_seconds,
+                    http_retries,
+                    maven_repositories,
+                )
     return None, None
+
+
+def normalized_maven_repositories(repositories: Optional[Iterable[str]]) -> List[str]:
+    values = list(repositories or [])
+    values.extend(MAVEN_REPOSITORIES)
+    result = []
+    seen = set()
+    for repository in values:
+        value = repository.strip()
+        value = value if value.endswith("/") else value + "/" if value else value
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result or list(MAVEN_REPOSITORIES)
 
 
 def normalize_repository_url(raw_url: str) -> Tuple[str, Optional[str]]:

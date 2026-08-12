@@ -54,6 +54,7 @@ If the console script is not installed, use the module form:
 
 ```bash
 python3 -m kasif scan /path/to/project --format json
+
 ```
 
 ## Commands
@@ -65,9 +66,23 @@ Discovers direct dependencies from supported project manifests and lockfiles.
 Useful options:
 
 - `--format table|json`: choose human-readable table output or structured JSON.
+- `--ecosystem NAME`: only include dependencies from an ecosystem.
+- `--exclude-ecosystem NAME`: exclude dependencies from an ecosystem.
+- `--manifest PATH`: parse only a selected manifest. May be repeated.
+- `--include-path GLOB`: only include matching manifest paths.
+- `--exclude-path GLOB`: exclude matching manifest paths.
+- `--strict`: fail on malformed JSON manifests and Maven POMs.
 - `--resolve-sources`: enrich exact-version dependencies with source metadata.
 - `--max-source-resolutions N`: cap registry and Git lookups during a scan.
 - `--shallow-check`: resolve Git refs without cloning or verifying manifests.
+- `--http-timeout-seconds N`: set the timeout for HTTP registry/archive requests.
+- `--retries N`: retry transient HTTP registry/archive failures.
+- `--cache-dir PATH`: choose the Kaşif cache root for default checkouts and archives.
+- `--offline` or `--cache-only`: disable network source lookups.
+- `--maven-repository URL`: query a custom Maven repository. May be repeated.
+- `--output FILE`: write stdout output to a file.
+- `--fail-on-unresolved`: return non-zero when source resolution leaves any
+  dependency unresolved.
 - `--progress`: print progress diagnostics to stderr.
 - `--no-default-ignores`: include normally skipped directories such as
   `node_modules`, `target`, `.git`, and virtual environments.
@@ -92,6 +107,10 @@ Supported ecosystems:
 - `pub`
 - `go`
 - `git`
+
+`scan` also discovers `vcpkg`, `conan`, and `cmake` manifests. These are
+discovery-only ecosystems today; when `--resolve-sources` is enabled, their
+source result is `SKIPPED` with `errorCode` set to `UNSUPPORTED_ECOSYSTEM`.
 
 Coordinate shape:
 
@@ -144,6 +163,12 @@ to source code. Successful responses can include:
 - manifest path
 - registry archive URL and SHA-256, when the ecosystem exposes one
 - local source archive path, when archive fallback is used
+- `kasifGitArguments` for source consumers that require Git coordinates
+- `kasifArguments` for source consumers that can accept Git coordinates or a
+  verified source archive
+
+JSON responses also include deprecated `ocakGitArguments` and `ocakArguments`
+aliases for compatibility. New integrations should read the `kasif*` fields.
 
 For Maven coordinates, Kaşif checks Maven Central and Google's Android Maven
 repository. Some artifacts publish valid POMs without source-control metadata
@@ -184,6 +209,10 @@ kasif find-source \
 
 The same option is available on `kasif scan --resolve-sources`.
 
+To choose the cache root for default checkouts and source archives, pass
+`--cache-dir` or set `KASIF_CACHE_DIR`. `DEFTER_CACHE_DIR` and
+`DOCTEXT_CACHE_DIR` remain deprecated compatibility aliases.
+
 ## Profiling
 
 Use `--enable-profiler` to print timing and traffic diagnostics to stderr
@@ -221,3 +250,6 @@ Run the test suite:
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+## AI Usage Disclosure
+This tool was created partly by the use of AI. As any software does, it may contain bugs, errors, etc. 
