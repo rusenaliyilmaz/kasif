@@ -475,6 +475,14 @@ class DependencyDiscoveryTest(unittest.TestCase):
 
             self.assertEqual(["tzlocal"], [dependency.name for dependency in dependencies])
 
+    def test_strict_malformed_manifest_aborts_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root / "package.json", "{not-json")
+
+            with self.assertRaises(Exception):
+                discover_dependencies(root, strict=True)
+
     def test_parser_exceptions_are_contained_per_manifest(self) -> None:
         progress_messages = []
 

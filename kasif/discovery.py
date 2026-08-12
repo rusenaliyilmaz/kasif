@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import fnmatch
+import json
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -85,14 +88,26 @@ def discover_dependencies(
     root: Path,
     use_default_ignores: bool = True,
     progress: Optional[Progress] = None,
+    include_ecosystems: Optional[Iterable[str]] = None,
+    exclude_ecosystems: Optional[Iterable[str]] = None,
+    include_paths: Optional[Iterable[str]] = None,
+    exclude_paths: Optional[Iterable[str]] = None,
+    manifest_paths: Optional[Iterable[Path]] = None,
+    strict: bool = False,
 ) -> List[Dependency]:
     dependencies: List[Dependency] = []
     root = root.resolve()
+    include_ecosystem_set = normalize_filter_values(include_ecosystems)
+    exclude_ecosystem_set = normalize_filter_values(exclude_ecosystems)
+    include_path_patterns = [pattern for pattern in (include_paths or []) if pattern]
+    exclude_path_patterns = [pattern for pattern in (exclude_paths or []) if pattern]
     file_count = 0
     manifest_count = 0
     last_progress = time.monotonic()
     report_progress(progress, f"scanning project files under {root}")
-    for path in iter_project_files(root, use_default_ignores):
+    explicit_manifests = manifest_paths is not None
+    paths = iter_manifest_paths(root, use_default_ignores, manifest_paths)
+    for path in paths:
         file_count += 1
         now = time.monotonic()
         if now - last_progress >= 5:
@@ -101,14 +116,20 @@ def discover_dependencies(
                 f"scanning files... files_seen={file_count} manifests_seen={manifest_count} current={safe_relative(path, root)}",
             )
             last_progress = now
-        if should_skip_manifest(path):
+        if not explicit_manifests and should_skip_manifest(path):
+            continue
+        relative_path = safe_relative(path, root)
+        if include_path_patterns and not path_matches_any(relative_path, include_path_patterns):
+            continue
+        if exclude_path_patterns and path_matches_any(relative_path, exclude_path_patterns):
             continue
         parser = parser_for(path)
         if parser is None:
             continue
         manifest_count += 1
         report_progress(progress, f"parsing manifest {safe_relative(path, root)}")
-        parsed = parse_manifest(parser, path, root, progress)
+        parsed = parse_manifest(parser, path, root, progress, strict=strict)
+        parsed = filter_dependencies(parsed, include_ecosystem_set, exclude_ecosystem_set)
         dependencies.extend(parsed)
         report_progress(progress, f"parsed {safe_relative(path, root)} dependencies={len(parsed)}")
     deduped = sorted(deduplicate(dependencies), key=dependency_sort_key)
@@ -117,6 +138,21 @@ def discover_dependencies(
         f"dependency discovery complete files_seen={file_count} manifests_seen={manifest_count} dependencies={len(deduped)}",
     )
     return deduped
+
+
+def iter_manifest_paths(
+    root: Path,
+    use_default_ignores: bool,
+    manifest_paths: Optional[Iterable[Path]],
+) -> Iterable[Path]:
+    if manifest_paths is None:
+        yield from iter_project_files(root, use_default_ignores)
+        return
+    for manifest_path in manifest_paths:
+        path = Path(manifest_path).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        yield path.resolve()
 
 
 def iter_project_files(root: Path, use_default_ignores: bool) -> Iterable[Path]:
@@ -137,8 +173,16 @@ def iter_project_files(root: Path, use_default_ignores: bool) -> Iterable[Path]:
                 yield entry
 
 
-def parse_manifest(parser: Parser, path: Path, root: Path, progress: Optional[Progress]) -> List[Dependency]:
+def parse_manifest(
+    parser: Parser,
+    path: Path,
+    root: Path,
+    progress: Optional[Progress],
+    strict: bool = False,
+) -> List[Dependency]:
     try:
+        if strict:
+            validate_manifest_syntax(path)
         return parser(path, root)
     except Exception as error:
         # Manifest parsers consume user-owned project files; a malformed or
@@ -147,7 +191,17 @@ def parse_manifest(parser: Parser, path: Path, root: Path, progress: Optional[Pr
             progress,
             f"skipped manifest {safe_relative(path, root)} error={error.__class__.__name__}",
         )
+        if strict:
+            raise
         return []
+
+
+def validate_manifest_syntax(path: Path) -> None:
+    if path.suffix == ".json" or path.name in {"Pipfile.lock"}:
+        json.loads(path.read_text(encoding="utf-8"))
+        return
+    if path.name == "pom.xml":
+        ET.parse(path)
 
 
 def safe_is_dir(path: Path) -> bool:
@@ -215,3 +269,39 @@ def safe_relative(path: Path, root: Path) -> str:
         return path.relative_to(root).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def normalize_filter_values(values: Optional[Iterable[str]]) -> Optional[Set[str]]:
+    if values is None:
+        return None
+    result = {value.strip().lower() for value in values if value.strip()}
+    return result or None
+
+
+def filter_dependencies(
+    dependencies: Iterable[Dependency],
+    include_ecosystems: Optional[Set[str]],
+    exclude_ecosystems: Optional[Set[str]],
+) -> List[Dependency]:
+    result = []
+    for dependency in dependencies:
+        ecosystem = dependency.ecosystem.lower()
+        if include_ecosystems is not None and ecosystem not in include_ecosystems:
+            continue
+        if exclude_ecosystems is not None and ecosystem in exclude_ecosystems:
+            continue
+        result.append(dependency)
+    return result
+
+
+def path_matches_any(relative_path: str, patterns: Iterable[str]) -> bool:
+    return any(path_matches_pattern(relative_path, pattern) for pattern in patterns)
+
+
+def path_matches_pattern(relative_path: str, pattern: str) -> bool:
+    normalized = pattern.strip().lstrip("./")
+    if not normalized:
+        return False
+    if any(character in normalized for character in "*?[]"):
+        return fnmatch.fnmatchcase(relative_path, normalized)
+    return relative_path == normalized or relative_path.startswith(normalized.rstrip("/") + "/")

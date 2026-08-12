@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kasif"
-version = "0.1.0"
-description = "Dependency discovery and source lookup CLI for Defter"
+version = "0.2.0"
+description = "Dependency discovery and source lookup CLI"
 requires-python = ">=3.9"
 
 [project.scripts]
