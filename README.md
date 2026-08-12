@@ -54,6 +54,7 @@ If the console script is not installed, use the module form:
 
 ```bash
 python3 -m kasif scan /path/to/project --format json
+
 ```
 
 ## Commands
@@ -249,3 +250,6 @@ Run the test suite:
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+## AI Usage Disclosure
+This tool was created partly by the use of AI. As any software does, it may contain bugs, errors, etc. 
